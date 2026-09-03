@@ -153,3 +153,43 @@ def downscale(file_bytes: bytes) -> tuple[bytes, str]:
         })
 
     return buffer.getvalue(), "image/jpeg"
+
+
+def _prepare(entry: tuple[bytes, str]) -> tuple[bytes, str]:
+    """One page, ready to send. Runs in a pool thread."""
+    file_bytes, media_type = entry
+
+    if media_type in DOWNSCALABLE:
+        return downscale(file_bytes)
+
+    return entry
+
+
+def downscale_all(
+    files: list[tuple[bytes, str]],
+) -> list[tuple[bytes, str]]:
+    """Prepare every page in parallel, preserving upload order.
+
+    Measured on 12 phone HEICs: 9.78s serial -> 1.95s pooled, 5.0x. Pillow
+    releases the GIL during decode, resize and encode, so threads genuinely
+    parallelise this. It matters for phone uploads specifically: HEVC decode
+    puts one HEIC page at 844ms against 97ms for an already-small JPEG, so a
+    12-page HEIC batch is ~8s of the request rather than ~1s.
+
+    Each page gets its own copy_context() because ThreadPoolExecutor does not
+    propagate contextvars the way asyncio.to_thread does - without it the
+    @traceable downscale_image spans lose their parent and show up in
+    LangSmith as orphan roots. One Context cannot be entered from two threads
+    at once, hence a copy per page rather than one shared copy.
+    """
+    # ponytail: no pool for a single page - a PDF or one photo is the common
+    # case and there is nothing to overlap.
+    if len(files) < 2:
+        return [_prepare(entry) for entry in files]
+
+    futures = [
+        _POOL.submit(copy_context().run, _prepare, entry)
+        for entry in files
+    ]
+
+    return [future.result() for future in futures]

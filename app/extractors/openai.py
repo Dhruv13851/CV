@@ -5,7 +5,7 @@ from langchain_openai import ChatOpenAI
 from langsmith import get_current_run_tree, traceable
 
 from app.config import PROMPTS_DIR
-from app.downscaling import downscale
+from app.downscaling import downscale_all
 from app.schemas import MedicalReport
 from app.streaming import stream_sections
 
@@ -15,15 +15,6 @@ SYSTEM_PROMPT = (PROMPTS_DIR / "extraction.md").read_text(encoding="utf-8")
 # real case. Raise both only together - they multiply.
 REQUEST_TIMEOUT = 120
 MAX_RETRIES = 1
-
-# Everything here is routed through downscale(), which returns JPEG or PNG.
-IMAGE_TYPES = {
-    "image/jpeg",
-    "image/png",
-    "image/heic",
-    "image/heif",
-}
-
 
 def _files_summary(inputs: dict) -> dict:
     """Shape of an upload, never its content. Patient data stays out."""
@@ -133,21 +124,15 @@ class OpenAIExtractor:
         The order IS the page order. A multi-page upload is one message with
         several images, not several messages.
         """
-        # ponytail: N decodes run serially here (~600ms each: HEIC decode,
-        # LANCZOS, JPEG, base64), so 12 pages adds ~7s to the request. It is
-        # off the event loop via to_thread, so nothing else stalls. Fan out
-        # over a thread pool if that wait starts to matter.
+        # Decoding happens here, in parallel across pages. It also normalises:
+        # HEIC comes back as JPEG, which OpenAI accepts, and no image can
+        # exceed the per-image patch limit once its long edge is capped at
+        # MAX_LONG_EDGE. Order is preserved, and order is page order.
         parts = [{"type": "text", "text": SYSTEM_PROMPT}]
         sent_types = []
         encoded_total = 0
 
-        for file_bytes, media_type in files:
-            if media_type in IMAGE_TYPES:
-                # Also normalises: HEIC comes back as JPEG, which OpenAI
-                # accepts, and no image can exceed the per-image patch limit
-                # once its long edge is capped at MAX_LONG_EDGE.
-                file_bytes, media_type = downscale(file_bytes)
-
+        for file_bytes, media_type in downscale_all(files):
             encoded_file = base64.b64encode(file_bytes).decode("utf-8")
             encoded_total += len(encoded_file)
             sent_types.append(media_type)

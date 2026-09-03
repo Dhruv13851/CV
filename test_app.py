@@ -321,6 +321,59 @@ def test_parse_accepts_one_or_many_on_the_same_field():
     assert too_many.status_code == 400 and "Too many" in too_many.text
 
 
+def test_downscale_all_is_parallel_and_ordered():
+    """Pages decode in a pool: order must hold and trace context must survive.
+
+    Measured 9.78s -> 1.95s on 12 phone HEICs. The risk is silent: a pool
+    thread that loses contextvars still returns the right bytes, it just
+    orphans the @traceable downscale_image spans in LangSmith.
+    """
+    import contextvars
+    import io
+    import threading
+
+    from app.downscaling import image as image_mod
+    from app.downscaling import downscale_all
+
+    def png(w, h, colour):
+        buf = io.BytesIO()
+        Image.new("RGB", (w, h), colour).save(buf, format="PNG")
+        return buf.getvalue()
+
+    # --- order survives the pool, and a PDF is forwarded untouched ---
+    pdf = (b"%PDF-1.4 not really", "application/pdf")
+    pages = [(png(80 + i, 100, c), "image/png")
+             for i, c in enumerate(("white", "red", "blue", "green"))]
+
+    out = downscale_all([pdf, *pages])
+    assert out[0] == pdf, "PDF was modified"
+    assert [b for b, _ in out[1:]] == [b for b, _ in pages], "pages reordered"
+
+    # single page skips the pool entirely but must still work
+    assert downscale_all([pages[0]]) == [pages[0]]
+    assert downscale_all([]) == []
+
+    # --- contextvars reach the workers (this is what keeps traces nested) ---
+    probe = contextvars.ContextVar("probe", default="MISSING")
+    seen, threads = [], set()
+    real = image_mod.downscale
+
+    def spy(file_bytes):
+        seen.append(probe.get())
+        threads.add(threading.current_thread().name)
+        return real(file_bytes)
+
+    image_mod.downscale = spy
+    try:
+        probe.set("carried")
+        downscale_all(pages)
+    finally:
+        image_mod.downscale = real
+
+    assert seen == ["carried"] * len(pages), seen
+    assert any(n.startswith("downscale") for n in threads), threads
+
+
 def test_docs_shows_a_file_picker():
     """/docs must offer file inputs, not a text box with "Add string item".
 
@@ -449,6 +502,7 @@ if __name__ == "__main__":
     test_grouping_detectors()
     test_multipage_upload()
     test_parse_accepts_one_or_many_on_the_same_field()
+    test_downscale_all_is_parallel_and_ordered()
     test_docs_shows_a_file_picker()
     test_service_tier_reaches_the_request()
     test_streaming_never_emits_partial_values()
