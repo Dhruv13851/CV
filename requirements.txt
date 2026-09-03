@@ -1,0 +1,13 @@
+# Pinned: langchain ships breaking changes frequently. Re-pin deliberately,
+# not by accident. Transitive deps float; use `pip freeze` if you need a lock.
+langchain==1.3.17
+langchain-openai==1.6.0
+langsmith==0.11.1
+python-dotenv==1.2.3
+pydantic==2.13.4
+pydantic-settings==2.15.0
+fastapi==0.141.1
+uvicorn==0.52.4
+python-multipart==0.0.32
+Pillow==12.3.0
+pillow-heif==1.6.0

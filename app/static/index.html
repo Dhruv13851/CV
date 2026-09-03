@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Medical Report Parser - stream monitor</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#161a21; --line:#242a35; --fg:#d7dce5;
+    --dim:#7d8798; --accent:#6ea8fe;
+    --green:#3fb950; --yellow:#d29922; --red:#f85149;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  header {
+    padding:14px 18px; border-bottom:1px solid var(--line);
+    display:flex; gap:14px; align-items:center; flex-wrap:wrap;
+  }
+  h1 { font-size:14px; margin:0; font-weight:600; }
+  input[type=file] { color:var(--dim); max-width:100%; }
+  button {
+    background:var(--accent); border:0; color:#0b0e13; font-weight:600;
+    padding:7px 16px; border-radius:5px; cursor:pointer; font-family:inherit;
+  }
+  button:disabled { opacity:.4; cursor:default; }
+  #clock { margin-left:auto; color:var(--dim); font-variant-numeric:tabular-nums; }
+  main { display:grid; grid-template-columns:minmax(320px,1fr) 1.4fr; gap:0;
+         height:calc(100vh - 57px); }
+  @media (max-width:820px){ main{grid-template-columns:1fr; height:auto;} }
+  section { overflow:auto; padding:14px 18px; }
+  #log { border-right:1px solid var(--line); }
+  h2 { font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+       color:var(--dim); margin:0 0 10px; font-weight:600; }
+  .row { display:flex; gap:10px; padding:3px 0; border-bottom:1px solid #1c212a; }
+  .t { color:var(--dim); min-width:56px; font-variant-numeric:tabular-nums; }
+  .k { min-width:96px; }
+  .k.status{color:var(--accent)} .k.heartbeat{color:var(--dim)}
+  .k.section{color:var(--green)} .k.result{color:var(--green)}
+  .k.error{color:var(--red)} .k.complete{color:var(--accent)}
+  .d { color:var(--dim); word-break:break-word; }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:7px; margin-bottom:12px; overflow:hidden; }
+  .card.prov { border-style:dashed; }
+  .card h3 { margin:0; padding:9px 12px; font-size:13px;
+             border-bottom:1px solid var(--line);
+             display:flex; justify-content:space-between; gap:10px; }
+  .tag { font-size:10px; color:var(--dim); font-weight:400; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td { padding:5px 12px; border-top:1px solid #1c212a; vertical-align:top; }
+  td.v { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  td.u, td.r { color:var(--dim); font-size:12px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+         margin-left:7px; vertical-align:middle; }
+  .Green{background:var(--green)} .Yellow{background:var(--yellow)} .Red{background:var(--red)}
+  .empty { color:var(--dim); padding:20px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>stream monitor</h1>
+  <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.heic,.heif">
+  <button id="go">Parse</button>
+  <span id="clock">idle</span>
+</header>
+
+<main>
+  <section id="log"><h2>events</h2><div id="rows"></div></section>
+  <section id="out"><h2>sections</h2><div id="cards">
+    <div class="empty">Pick a report and hit Parse.</div>
+  </div></section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const rows = $('#rows'), cards = $('#cards');
+let t0 = 0, timer = null;
+
+function log(kind, detail) {
+  const el = document.createElement('div');
+  el.className = 'row';
+  el.innerHTML = `<span class="t">${((performance.now()-t0)/1000).toFixed(2)}s</span>`
+    + `<span class="k ${kind}">${kind}</span>`
+    + `<span class="d"></span>`;
+  el.lastElementChild.textContent = detail || '';
+  rows.appendChild(el);
+  $('#log').scrollTop = 1e9;
+}
+
+// provisional=true -> streamed early, structurally complete but not validated
+function card(section, provisional) {
+  const el = document.createElement('div');
+  el.className = 'card' + (provisional ? ' prov' : '');
+  const h = document.createElement('h3');
+  h.append(section.category_name ?? '(unnamed)');
+  const tag = document.createElement('span');
+  tag.className = 'tag';
+  tag.textContent = provisional ? 'streamed · provisional' : 'validated';
+  h.append(tag);
+  el.append(h);
+
+  const table = document.createElement('table');
+  for (const t of section.tests || []) {
+    const tr = table.insertRow();
+    tr.insertCell().textContent = t.name ?? '';
+    const v = tr.insertCell(); v.className = 'v';
+    v.append(String(t.result ?? ''));
+    if (t.indicator) {
+      const d = document.createElement('span');
+      d.className = 'dot ' + t.indicator;
+      d.title = t.indicator;
+      v.append(d);
+    }
+    const u = tr.insertCell(); u.className = 'u'; u.textContent = t.unit ?? '';
+    const r = tr.insertCell(); r.className = 'r';
+    r.textContent = (t.reference_ranges || [])
+      .map(x => `${x.label ? x.label + ': ' : ''}${x.min_val ?? ''}-${x.max_val ?? ''}`)
+      .join('  ');
+  }
+  el.append(table);
+  return el;
+}
+
+function handle(e) {
+  if (e.type === 'status') {
+    log('status', `${e.stage} ${e.bytes ? '· ' + e.bytes + ' bytes' : ''}`
+      + `${e.deadline_seconds ? '· deadline ' + e.deadline_seconds + 's' : ''}`);
+  } else if (e.type === 'heartbeat') {
+    log('heartbeat', `alive · ${e.elapsed_seconds}s`);
+  } else if (e.type === 'section') {
+    log('section', `[${e.index}] ${e.data.category_name} · `
+      + `${(e.data.tests || []).length} tests`);
+    cards.append(card(e.data, true));
+  } else if (e.type === 'result') {
+    const n = (e.data.sections || []).reduce((a, s) => a + (s.tests || []).length, 0);
+    log('result', `validated · ${e.data.sections.length} sections · ${n} tests`
+      + ` · ${e.elapsed_seconds}s`);
+    // replace the provisional cards with the validated report
+    cards.textContent = '';
+    for (const s of e.data.sections) cards.append(card(s, false));
+  } else if (e.type === 'error') {
+    log('error', `${e.stage ? e.stage + ': ' : ''}${e.message}`);
+  } else {
+    log(e.type, '');
+  }
+}
+
+$('#go').onclick = async () => {
+  const f = $('#file').files[0];
+  if (!f) return alert('Pick a file first.');
+
+  rows.textContent = ''; cards.textContent = '';
+  $('#go').disabled = true;
+  t0 = performance.now();
+  timer = setInterval(() => {
+    $('#clock').textContent = ((performance.now() - t0) / 1000).toFixed(1) + 's';
+  }, 100);
+
+  const body = new FormData(); body.append('file', f);
+  try {
+    const res = await fetch('/parse', { method: 'POST', body });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`);
+
+    // EventSource cannot POST multipart, so parse the SSE frames by hand.
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const frames = buf.split('\n\n');
+      buf = frames.pop();
+      for (const frame of frames) {
+        const line = frame.split('\n').find(l => l.startsWith('data: '));
+        if (line) handle(JSON.parse(line.slice(6)));
+      }
+    }
+  } catch (err) {
+    log('error', String(err));
+  } finally {
+    clearInterval(timer);
+    $('#clock').textContent = ((performance.now() - t0) / 1000).toFixed(1) + 's · done';
+    $('#go').disabled = false;
+  }
+};
+</script>
+</body>
+</html>

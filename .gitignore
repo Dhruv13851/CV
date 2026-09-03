@@ -1,0 +1,30 @@
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Patient data / uploads - medical documents must not enter git history.
+# Bracket classes, not plain *.pdf: gitignore is case-sensitive and cameras
+# write IMG_0001.HEIC / DSC_0001.JPG in upper case.
+samples/
+Data/
+*.[pP][dD][fF]
+*.[pP][nN][gG]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[hH][eE][iI][cC]
+*.[hH][eE][iI][fF]
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.idea/
+.DS_Store
