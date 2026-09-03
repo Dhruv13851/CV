@@ -25,6 +25,16 @@ IMAGE_TYPES = {
 }
 
 
+def _files_summary(inputs: dict) -> dict:
+    """Shape of an upload, never its content. Patient data stays out."""
+    files = inputs.get("files") or []
+    return {
+        "pages": len(files),
+        "input_bytes": sum(len(b) for b, _ in files),
+        "media_types": sorted({mt for _, mt in files}),
+    }
+
+
 def _report_summary(report) -> dict:
     """Shape of the extraction, not its contents. Patient data stays out."""
     if not isinstance(report, MedicalReport):
@@ -70,11 +80,15 @@ class OpenAIExtractor:
         self,
         model: str,
         api_key: str,
+        service_tier: str = "default",
     ):
         self.llm = ChatOpenAI(
             model=model,
             api_key=api_key,
             temperature=0,
+            # Empty string means "send no service_tier", so the project
+            # default applies instead of a value the model may reject.
+            service_tier=service_tier or None,
             # LangChain discards the OpenAI SDK's default timeout and leaves
             # httpx on Timeout(None) - an unanswered request would hang the
             # task, its thread and a pool slot forever. Set it explicitly.
@@ -87,6 +101,8 @@ class OpenAIExtractor:
             # Streaming resets the clock per chunk, so only a real stall trips.
             streaming=True,
         )
+
+        self.service_tier = service_tier
 
         self.structured_llm = self.llm.with_structured_output(
             MedicalReport
@@ -105,101 +121,90 @@ class OpenAIExtractor:
         run_type="tool",
         name="build_content",
         # payload carries the document itself - log shape, never content
-        process_inputs=lambda i: {
-            "media_type": i.get("media_type"),
-            "input_bytes": len(i.get("file_bytes") or b""),
-        },
+        process_inputs=_files_summary,
         process_outputs=lambda o: {"parts": len(o) if o else 0},
     )
     def _build_content(
         self,
-        file_bytes: bytes,
-        media_type: str,
+        files: list[tuple[bytes, str]],
     ):
-        if media_type in IMAGE_TYPES:
-            # Also normalises: HEIC comes back as JPEG, which OpenAI accepts.
-            file_bytes, media_type = downscale(file_bytes)
+        """One system prompt, then one part per page, in the order given.
 
-        encoded_file = base64.b64encode(
-            file_bytes
-        ).decode("utf-8")
+        The order IS the page order. A multi-page upload is one message with
+        several images, not several messages.
+        """
+        # ponytail: N decodes run serially here (~600ms each: HEIC decode,
+        # LANCZOS, JPEG, base64), so 12 pages adds ~7s to the request. It is
+        # off the event loop via to_thread, so nothing else stalls. Fan out
+        # over a thread pool if that wait starts to matter.
+        parts = [{"type": "text", "text": SYSTEM_PROMPT}]
+        sent_types = []
+        encoded_total = 0
 
-        self._record_payload(media_type, len(encoded_file))
+        for file_bytes, media_type in files:
+            if media_type in IMAGE_TYPES:
+                # Also normalises: HEIC comes back as JPEG, which OpenAI
+                # accepts, and no image can exceed the per-image patch limit
+                # once its long edge is capped at MAX_LONG_EDGE.
+                file_bytes, media_type = downscale(file_bytes)
 
-        if media_type == "application/pdf":
+            encoded_file = base64.b64encode(file_bytes).decode("utf-8")
+            encoded_total += len(encoded_file)
+            sent_types.append(media_type)
 
-            file_data = (
-                f"data:application/pdf;base64,{encoded_file}"
-            )
-
-            return [
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                },
-                {
+            if media_type == "application/pdf":
+                parts.append({
                     "type": "file",
                     "file": {
                         "filename": "medical_report.pdf",
-                        "file_data": file_data,
+                        "file_data": (
+                            f"data:application/pdf;base64,{encoded_file}"
+                        ),
                     },
-                },
-            ]
+                })
 
-        elif media_type in {
-            "image/jpeg",
-            "image/png",
-        }:
-
-            image_data = (
-                f"data:{media_type};base64,{encoded_file}"
-            )
-
-            return [
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                },
-                {
+            elif media_type in {"image/jpeg", "image/png"}:
+                parts.append({
                     "type": "image_url",
                     "image_url": {
-                        "url": image_data,
+                        "url": f"data:{media_type};base64,{encoded_file}",
                     },
-                },
-            ]
+                })
 
-        else:
-            raise ValueError(
-                f"Unsupported media type: {media_type}"
-            )
+            else:
+                raise ValueError(
+                    f"Unsupported media type: {media_type}"
+                )
 
-    def _record_payload(self, media_type: str, encoded_len: int) -> None:
+        self._record_payload(sent_types, encoded_total)
+
+        return parts
+
+    def _record_payload(self, media_types: list[str], encoded_len: int) -> None:
         run = get_current_run_tree()
         if run is not None:
             run.metadata.update({
-                "sent_media_type": media_type,
+                "pages": len(media_types),
+                "sent_media_types": sorted(set(media_types)),
                 "base64_payload_mb": round(encoded_len / 1e6, 2),
+                # What we ASKED for. The response echoes service_tier
+                # "priority" for both "fast" and "priority", so the echo is
+                # not proof the request was served at this tier.
+                "requested_service_tier": self.service_tier or "project default",
             })
 
     @traceable(
         run_type="chain",
         name="extract",
-        process_inputs=lambda i: {
-            "media_type": i.get("media_type"),
-            "input_bytes": len(i.get("file_bytes") or b""),
-        },
+        process_inputs=_files_summary,
         process_outputs=_report_summary,
     )
     def extract(
         self,
-        file_bytes: bytes,
-        media_type: str,
+        files: list[tuple[bytes, str]],
     ) -> MedicalReport:
 
-        content = self._build_content(
-            file_bytes,
-            media_type,
-        )
+        content = self._build_content(files)
 
         return self.structured_llm.invoke(
             [
@@ -213,26 +218,18 @@ class OpenAIExtractor:
     @traceable(
         run_type="chain",
         name="extract_async",
-        process_inputs=lambda i: {
-            "media_type": i.get("media_type"),
-            "input_bytes": len(i.get("file_bytes") or b""),
-        },
+        process_inputs=_files_summary,
         process_outputs=_report_summary,
     )
     async def extract_async(
         self,
-        file_bytes: bytes,
-        media_type: str,
+        files: list[tuple[bytes, str]],
     ) -> MedicalReport:
 
-        # Decode + LANCZOS resize + JPEG + base64 is ~600ms of CPU. On the
-        # event loop that freezes every other request, /health included.
-        # to_thread copies contextvars, so LangSmith spans still nest.
-        content = await asyncio.to_thread(
-            self._build_content,
-            file_bytes,
-            media_type,
-        )
+        # Decode + LANCZOS resize + JPEG + base64 is ~600ms of CPU per page.
+        # On the event loop that freezes every other request, /health
+        # included. to_thread copies contextvars, so LangSmith spans nest.
+        content = await asyncio.to_thread(self._build_content, files)
 
         return await self.structured_llm.ainvoke(
             [
@@ -245,15 +242,12 @@ class OpenAIExtractor:
 
     async def extract_sections_async(
         self,
-        file_bytes: bytes,
-        media_type: str,
+        files: list[tuple[bytes, str]],
     ):
-        """Stream ("section", dict) per category, then ("report", model)."""
-        content = await asyncio.to_thread(
-            self._build_content,
-            file_bytes,
-            media_type,
-        )
+        """Stream ("header", dict), a ("section", dict) per category, then
+        ("report", model). All pages go in one request, so the model can
+        merge a table that continues onto the next page."""
+        content = await asyncio.to_thread(self._build_content, files)
 
         messages = [
             {

@@ -6,19 +6,46 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
-from langsmith import get_current_run_tree, trace, traceable
+from langsmith import trace
 
 load_dotenv()
 
 from .config import Settings
 from .extractors.openai import _report_summary
-from .ingestion import get_media_type
+from .ingestion import MAX_UPLOAD_BYTES, media_types_for
 from .pipeline import MedicalReportPipeline
 
 app = FastAPI(
     title="Medical Report Parser",
     version="0.1.0",
 )
+
+
+def _swagger_file_pickers(node):
+    """Spell "binary" the way Swagger UI understands. /docs only.
+
+    FastAPI emits OpenAPI 3.1, where an upload is
+    {"type": "string", "contentMediaType": "application/octet-stream"}.
+    The bundled Swagger UI only renders the 3.0 spelling, "format": "binary",
+    as a file picker - and inside an array's `items` it gives up entirely and
+    offers a text box with "Add string item". Rewriting the spelling is
+    cosmetic: the endpoint itself takes ordinary multipart either way.
+    """
+    if isinstance(node, dict):
+        if node.pop("contentMediaType", None) == "application/octet-stream":
+            node["format"] = "binary"
+        for value in node.values():
+            _swagger_file_pickers(value)
+    elif isinstance(node, list):
+        for value in node:
+            _swagger_file_pickers(value)
+    return node
+
+
+# FastAPI caches the spec, so this rewrites one dict once and is idempotent -
+# a second pass finds no contentMediaType left to change.
+_generated_openapi = app.openapi
+app.openapi = lambda: _swagger_file_pickers(_generated_openapi())
 
 
 settings = Settings()
@@ -39,34 +66,6 @@ def event(**payload) -> str:
     return "data: " + json.dumps(payload) + "\n\n"
 
 
-@traceable(
-    run_type="chain",
-    name="parse_report",
-    # filename can identify a patient; log its shape, not the name
-    process_inputs=lambda i: {
-        "media_type": i.get("media_type"),
-        "upload_bytes": len(i.get("file_bytes") or b""),
-        "extension": (i.get("filename") or "").rsplit(".", 1)[-1].lower(),
-    },
-    # the extraction itself is summarised on the extract_async span
-    process_outputs=lambda _: {"status": "ok"},
-)
-async def run_extraction(
-    file_bytes: bytes,
-    media_type: str,
-    filename: str,  # noqa: ARG001 - read by process_inputs above, keep it
-):
-    """Root trace span for one upload. Children: build_content -> LLM call."""
-    run = get_current_run_tree()
-    if run is not None:
-        run.metadata["model"] = settings.openai_model
-
-    return await pipeline.extractor.extract_async(
-        file_bytes=file_bytes,
-        media_type=media_type,
-    )
-
-
 @app.get("/health")
 def health():
     return {
@@ -82,11 +81,43 @@ def monitor():
     )
 
 
+async def _read_capped(upload: UploadFile, budget: int) -> bytes:
+    """Read one upload, refusing to buffer more than `budget` bytes.
+
+    `await upload.read()` with no argument is unbounded, so a single request
+    can exhaust memory - and a multi-page upload multiplies it by the page
+    count. Cheaper to refuse than to swap.
+    """
+    data = bytearray()
+
+    while chunk := await upload.read(1 << 20):
+        data += chunk
+        if len(data) > budget:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Upload exceeds the "
+                    f"{MAX_UPLOAD_BYTES // (1 << 20)} MB total limit."
+                ),
+            )
+
+    if not data:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{upload.filename} is empty.",
+        )
+
+    return bytes(data)
+
+
 @app.post("/parse")
 async def parse_report(
-    file: UploadFile = File(...)
+    # Stays named `file` even though it is a list: the parameter name is the
+    # multipart field name, so renaming it would break every existing client.
+    # One part named `file` arrives as a 1-element list.
+    file: list[UploadFile] = File(...)
 ):
-    if not file.filename:
+    if any(not upload.filename for upload in file):
         raise HTTPException(
             status_code=400,
             detail="Filename is required.",
@@ -94,14 +125,23 @@ async def parse_report(
 
     # Browsers disagree about HEIC: Safari sends image/heic, Chrome on
     # Android often sends application/octet-stream. The extension is the
-    # only thing every client gets right, and it validates the upload
-    # before we read the body.
+    # only thing every client gets right, and it validates the whole upload
+    # before we read a single body.
     try:
-        media_type = get_media_type(file.filename)
+        media_types = media_types_for([u.filename for u in file])
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    file_bytes = await file.read()
+    # Page order is upload order. The budget is shared across pages, so a
+    # dozen small photos and one huge scan hit the same ceiling.
+    files = []
+    for upload, media_type in zip(file, media_types):
+        spent = sum(len(data) for data, _ in files)
+        files.append(
+            (await _read_capped(upload, MAX_UPLOAD_BYTES - spent), media_type)
+        )
+
+    upload_bytes = sum(len(data) for data, _ in files)
 
     async def generate():
         started = time.monotonic()
@@ -115,7 +155,8 @@ async def parse_report(
                 type="status",
                 stage="received",
                 message="Report received",
-                bytes=len(file_bytes),
+                bytes=upload_bytes,
+                pages=len(files),
             )
 
             yield event(
@@ -130,16 +171,18 @@ async def parse_report(
                 run_type="chain",
                 # filename can identify a patient; log its shape, not the name
                 inputs={
-                    "media_type": media_type,
-                    "upload_bytes": len(file_bytes),
-                    "extension": file.filename.rsplit(".", 1)[-1].lower(),
+                    "pages": len(files),
+                    "media_types": sorted(set(media_types)),
+                    "upload_bytes": upload_bytes,
+                    "extensions": sorted({
+                        u.filename.rsplit(".", 1)[-1].lower() for u in file
+                    }),
                 },
                 metadata={"model": settings.openai_model},
             ) as run:
 
                 stream = pipeline.extractor.extract_sections_async(
-                    file_bytes=file_bytes,
-                    media_type=media_type,
+                    files=files,
                 )
 
                 while True:
@@ -171,6 +214,12 @@ async def parse_report(
                         kind, payload = pending.result()
                     except StopAsyncIteration:
                         break
+
+                    if kind == "header":
+                        # Provisional, like section below: patient identity
+                        # lands ~12s before the validated result.
+                        yield event(type="header", data=payload)
+                        continue
 
                     if kind == "section":
                         sections_sent += 1

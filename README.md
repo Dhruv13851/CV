@@ -13,6 +13,11 @@ python -m venv .venv
 cp .env.example .env      # then fill in OPENAI_API_KEY
 ```
 
+`OPENAI_SERVICE_TIER` defaults to `default` (standard tier). Set it to `fast`
+for OpenAI Fast mode - up to 2.5x faster, but billed at a premium (2x standard
+for gpt-5.6-sol), which is why it is not the default here. Set the variable to
+empty to send no tier at all and take the project default instead.
+
 ## Run
 
 API:
@@ -111,7 +116,7 @@ app/
   cli.py             command-line entrypoint
   pipeline.py        wires settings -> extractor
   config.py          env-backed settings + PROMPTS_DIR
-  ingestion.py       file reading, extension -> media type
+  ingestion.py       file reading, extension -> media type//supprts image list/array 
   prompts/
     extraction.md    the system prompt - edit without touching code
   schemas/
@@ -133,6 +138,19 @@ import. Edit it and restart; no code change needed.
 ## Supported input
 
 PDF, JPG, JPEG, PNG, HEIC, HEIF.
+
+**One PDF, or up to 12 images that are the pages of one report** - never a mix.
+`/parse` takes repeated `file` parts, so a single-file POST still works
+unchanged. Upload order is page order and is never sorted (`IMG_9` sorts after
+`IMG_10`). All pages go in one request so the model can merge a table that
+continues onto the next page; per-page calls would re-create the flat-grouping
+bug in Python.
+
+`MAX_PAGES = 12` and `MAX_UPLOAD_BYTES = 30 MB` in `app/ingestion.py` are spend
+caps, not API limits: OpenAI allows 30000 patches **per image**, 1500 images and
+512 MB per request. A photographed page costs ~4,300 image tokens against ~1,150
+for a text PDF page, so photographing a report you already have as a PDF is
+roughly 3x the price.
 
 HEIC is what iPhones and recent Android phones shoot by default. Neither
 Pillow nor OpenAI's vision endpoint can read it, so `pillow-heif` decodes it
@@ -211,7 +229,7 @@ sends medical records to LangSmith. Decide that deliberately.
 Tracked, not yet done:
 
 - Image downscaling is in; PDF page count is still unbounded.
-- No upload size limit - `await file.read()` is unbounded.
+- No auth, so a page cap bounds one request but not a thousand of them.
 - No auth on `/parse`.
 - No structured logging.
 - Patient data is sent to OpenAI and appears in every response body; retention

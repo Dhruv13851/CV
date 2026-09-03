@@ -1,4 +1,8 @@
 """Run: python test_app.py"""
+import asyncio
+
+from PIL import Image
+
 from app.schemas import MedicalReport
 
 
@@ -179,6 +183,166 @@ def test_grouping_detectors():
     assert summary["suspect_flat_grouping"] is False
 
 
+def test_service_tier_reaches_the_request():
+    """Fast mode is a request field, not a client-side setting.
+
+    The Fast mode guide names only gpt-5.6-sol, so this asserts plumbing,
+    not that the model honours it - the response echoes "priority" for both
+    "fast" and "priority", so only billing tells you what you actually got.
+    """
+    from app.extractors.openai import OpenAIExtractor
+
+    msg = [{"role": "user", "content": "x"}]
+
+    fast = OpenAIExtractor(model="gpt-5.6-luna", api_key="sk-test", service_tier="fast")
+    assert fast.llm._get_request_payload(msg)["service_tier"] == "fast"
+
+    # empty means "send no tier", not "send an empty one" - an unsupported
+    # model should be able to fall back without a code change
+    off = OpenAIExtractor(model="gpt-5.6-luna", api_key="sk-test", service_tier="")
+    assert off.llm._get_request_payload(msg).get("service_tier") is None
+
+    # the default is standard tier, matching Settings - fast mode costs a
+    # premium and must never be what you get by forgetting to set it
+    assert OpenAIExtractor(model="m", api_key="k").service_tier == "default"
+    assert (OpenAIExtractor(model="m", api_key="k")
+            .llm._get_request_payload(msg)["service_tier"] == "default")
+
+
+def test_multipage_upload():
+    """One report, N pages: validation, caps, and one prompt for the batch."""
+    import io
+
+    from fastapi import HTTPException
+
+    from app.extractors.openai import OpenAIExtractor, _files_summary
+    from app.ingestion import MAX_PAGES, media_types_for
+
+    # --- whole-upload validation, before a single byte is read ---
+    assert media_types_for(["r.pdf"]) == ["application/pdf"]
+    # iPhone writes IMG_0001.HEIC; order is page order, never sorted
+    assert media_types_for(["b.HEIC", "a.jpg"]) == ["image/heic", "image/jpeg"]
+
+    for bad, expect in [
+        ([], "No file"),
+        (["a.pdf", "b.jpg"], "not both"),          # one PDF or N images
+        (["x.jpg"] * (MAX_PAGES + 1), "Too many"),
+        (["a.txt"], "Unsupported"),
+    ]:
+        try:
+            media_types_for(bad)
+            raise AssertionError(f"{bad} should have been rejected")
+        except ValueError as exc:
+            assert expect in str(exc), (bad, str(exc))
+
+    # --- one system prompt for the batch, one part per page, order kept ---
+    def png(w, h, colour):
+        buf = io.BytesIO()
+        Image.new("RGB", (w, h), colour).save(buf, format="PNG")
+        return buf.getvalue()
+
+    ex = OpenAIExtractor(model="m", api_key="k")
+    pages = [(png(80, 100, c), "image/png") for c in ("white", "red", "blue")]
+    parts = ex._build_content(pages)
+
+    assert [p["type"] for p in parts] == [
+        "text", "image_url", "image_url", "image_url"], parts
+    assert sum(1 for p in parts if p["type"] == "text") == 1, "prompt sent twice"
+    # small PNGs pass through untouched, so the payload order is checkable
+    import base64
+    for sent, (raw, _) in zip(
+        [p for p in parts if p["type"] == "image_url"], pages
+    ):
+        assert base64.b64decode(
+            sent["image_url"]["url"].split(",", 1)[1]
+        ) == raw, "pages reordered"
+
+    # a PDF still takes the file part, not image_url
+    assert [p["type"] for p in ex._build_content(
+        [(b"%PDF-1.4 fake", "application/pdf")]
+    )] == ["text", "file"]
+
+    # --- traces carry shape only ---
+    assert _files_summary({"files": pages}) == {
+        "pages": 3,
+        "input_bytes": sum(len(b) for b, _ in pages),
+        "media_types": ["image/png"],
+    }
+
+    # --- the read cap is a real guard, not a comment ---
+    from app.main import _read_capped
+
+    class FakeUpload:
+        filename = "big.jpg"
+
+        def __init__(self, data):
+            self._buf = io.BytesIO(data)
+
+        async def read(self, size=-1):
+            return self._buf.read(size)
+
+    assert asyncio.run(_read_capped(FakeUpload(b"x" * 100), 1000)) == b"x" * 100
+
+    for data, budget, code in [(b"x" * 2000, 1000, 413), (b"", 1000, 400)]:
+        try:
+            asyncio.run(_read_capped(FakeUpload(data), budget))
+            raise AssertionError(f"{len(data)}B/{budget} should have raised")
+        except HTTPException as exc:
+            assert exc.status_code == code, (len(data), budget, exc.status_code)
+
+
+def test_parse_accepts_one_or_many_on_the_same_field():
+    """The form field stays `file`, so existing single-upload clients work."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+
+    # rejected before any model call, so this needs no API key or credits
+    one = client.post("/parse", files=[("file", ("a.txt", b"x", "text/plain"))])
+    assert one.status_code == 400, one.text
+    assert "Unsupported file type" in one.text
+
+    many = client.post("/parse", files=[
+        ("file", (f"p{i}.txt", b"x", "text/plain")) for i in range(3)
+    ])
+    assert many.status_code == 400, many.text
+
+    mixed = client.post("/parse", files=[
+        ("file", ("r.pdf", b"%PDF", "application/pdf")),
+        ("file", ("p.jpg", b"x", "image/jpeg")),
+    ])
+    assert mixed.status_code == 400 and "not both" in mixed.text, mixed.text
+
+    too_many = client.post("/parse", files=[
+        ("file", (f"p{i}.jpg", b"x", "image/jpeg")) for i in range(13)
+    ])
+    assert too_many.status_code == 400 and "Too many" in too_many.text
+
+
+def test_docs_shows_a_file_picker():
+    """/docs must offer file inputs, not a text box with "Add string item".
+
+    FastAPI emits OpenAPI 3.1 (contentMediaType); Swagger UI only renders the
+    3.0 spelling (format: binary) as a picker, and not at all inside `items`.
+    """
+    import json
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    spec = TestClient(app).get("/openapi.json").json()
+    body = spec["paths"]["/parse"]["post"]["requestBody"]
+    ref = body["content"]["multipart/form-data"]["schema"]["$ref"]
+    prop = spec["components"]["schemas"][ref.rsplit("/", 1)[-1]]["properties"]["file"]
+
+    assert prop["type"] == "array", prop          # several pages
+    assert prop["items"] == {"type": "string", "format": "binary"}, prop
+    assert "contentMediaType" not in json.dumps(spec), "3.1 spelling left behind"
+
+
 def test_streaming_never_emits_partial_values():
     """The whole point: a streamed value must equal its final value.
 
@@ -238,18 +402,29 @@ def test_streaming_never_emits_partial_values():
                 yield self.shape(args[i:i + self.size])
 
     async def run(size, shape):
-        streamed, final = [], None
+        streamed, headers, final, order = [], [], None, []
         async for kind, payload in stream_sections(FakeLLM(size, shape), []):
+            order.append(kind)
             if kind == "section":
                 streamed.append(payload)
+            elif kind == "header":
+                headers.append(payload)
             else:
                 final = payload
-        return streamed, final
+        return streamed, headers, final, order
 
     for shape in SHAPES:
         for size in (1, 3, 7, 64, 10_000):   # incl. 1 char/chunk worst case
             where = f"{shape} @ {size}"
-            streamed, final = asyncio.run(run(size, shape))
+            streamed, headers, final, order = asyncio.run(run(size, shape))
+
+            # exactly one header, whole, and before any section - a header
+            # emitted early would render "SMITH, JOHN" as "S", then "SMI"
+            assert len(headers) == 1, (where, headers)
+            assert headers[0]["patient"] == {"name": "SMITH, JOHN"}, (where, headers[0])
+            assert headers[0]["report_title"] == "PANEL", (where, headers[0])
+            assert headers[0]["lab_name"] is None, (where, headers[0])
+            assert order[0] == "header", (where, order[:3])
 
             for section in streamed:
                 for test in section["tests"]:
@@ -272,5 +447,9 @@ if __name__ == "__main__":
     test_downscale()
     test_traces_carry_no_payload_or_phi()
     test_grouping_detectors()
+    test_multipage_upload()
+    test_parse_accepts_one_or_many_on_the_same_field()
+    test_docs_shows_a_file_picker()
+    test_service_tier_reaches_the_request()
     test_streaming_never_emits_partial_values()
     print("ok")

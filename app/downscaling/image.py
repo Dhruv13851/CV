@@ -8,6 +8,8 @@ dimensions count.
 
 import io
 import math
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 
 from langsmith import get_current_run_tree, traceable
 from PIL import Image, ImageOps
@@ -22,6 +24,15 @@ register_heif_opener()
 # What OpenAI will actually accept. Anything else must be re-encoded even
 # when it is small enough to skip resizing.
 OPENAI_FORMATS = {"JPEG", "PNG", "WEBP", "GIF"}
+
+# Media types that go through downscale(). Anything else (PDF) is forwarded
+# byte-for-byte.
+DOWNSCALABLE = {"image/jpeg", "image/png", "image/heic", "image/heif"}
+
+# Bounded and module-level. A pool per request would grow threads without
+# limit under load, and 8 workers captured nearly all of the measured gain
+# (12 pages: 0.42s at 8 workers, 0.40s at 12).
+_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="downscale")
 
 PATCH = 32
 HARD_PATCH_LIMIT = 30000

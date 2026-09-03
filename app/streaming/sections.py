@@ -19,6 +19,11 @@ from langchain_core.utils.json import parse_partial_json
 
 from app.schemas import MedicalReport
 
+# Written before `sections` in the schema, so the model emits them first and
+# they are closed by the time the `sections` key appears. Reorder the schema
+# and the header event degrades to nulls - `result` stays correct regardless.
+HEADER_FIELDS = ("patient", "lab_name", "doctor_name", "report_title")
+
 
 
 
@@ -49,13 +54,14 @@ def _fragment(chunk) -> str:
 
 
 async def stream_sections(tool_llm, messages) -> AsyncIterator[tuple]:
-    """Yield ("section", dict) as each category closes, then ("report", model).
+    """Yield ("header", dict), ("section", dict) per category, ("report", model).
 
-    The final report is validated; streamed sections are raw dicts and should
-    be treated as provisional until the report arrives.
+    The final report is validated; the header and streamed sections are raw
+    dicts and should be treated as provisional until the report arrives.
     """
     buffer = ""
     emitted = 0
+    header_sent = False
 
     async for chunk in tool_llm.astream(messages):
         fragment = _fragment(chunk)
@@ -74,6 +80,13 @@ async def stream_sections(tool_llm, messages) -> AsyncIterator[tuple]:
         partial = parse_partial_json(buffer)
         if not isinstance(partial, dict):
             continue
+
+        # Once `sections` exists, every key above it is closed - the same
+        # argument that makes sections[:-1] safe. Emitting sooner would
+        # render "Padmaram Mali" as "P", then "Pad".
+        if not header_sent and "sections" in partial:
+            header_sent = True
+            yield "header", {k: partial.get(k) for k in HEADER_FIELDS}
 
         sections = partial.get("sections")
         if not isinstance(sections, list):

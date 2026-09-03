@@ -12,7 +12,11 @@ def main():
 
     parser.add_argument(
         "file",
-        help="Path to PDF, JPG, JPEG, PNG, HEIC, or HEIF report.",
+        nargs="+",
+        help=(
+            "One PDF, or the pages of one report as images "
+            "(JPG, JPEG, PNG, HEIC, HEIF) in page order."
+        ),
     )
 
     args = parser.parse_args()
@@ -20,7 +24,7 @@ def main():
     settings = Settings()
     pipeline = MedicalReportPipeline(settings)
 
-    result = pipeline.process_file(args.file)
+    result = pipeline.process_files(args.file)
 
     print(
         json.dumps(

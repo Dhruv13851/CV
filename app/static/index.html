@@ -38,6 +38,7 @@
   .k { min-width:96px; }
   .k.status{color:var(--accent)} .k.heartbeat{color:var(--dim)}
   .k.section{color:var(--green)} .k.result{color:var(--green)}
+  .k.header{color:var(--accent)}
   .k.error{color:var(--red)} .k.complete{color:var(--accent)}
   .d { color:var(--dim); word-break:break-word; }
   .card { background:var(--panel); border:1px solid var(--line);
@@ -55,19 +56,45 @@
          margin-left:7px; vertical-align:middle; }
   .Green{background:var(--green)} .Yellow{background:var(--yellow)} .Red{background:var(--red)}
   .empty { color:var(--dim); padding:20px 0; }
+  #who { background:var(--panel); border:1px solid var(--line);
+         border-radius:7px; padding:10px 12px; margin-bottom:12px;
+         display:flex; flex-wrap:wrap; gap:6px 22px; font-size:13px; }
+  #who.prov { border-style:dashed; }
+  #who span b { color:var(--dim); font-weight:normal; margin-right:5px; }
+  #pages { background:var(--panel); border:1px solid var(--line);
+           border-radius:7px; padding:8px 10px; margin-bottom:14px;
+           font-size:12px; }
+  .p { display:flex; gap:9px; align-items:center; padding:2px 0; }
+  .pn { color:var(--dim); min-width:18px; text-align:right;
+        font-variant-numeric:tabular-nums; }
+  .pf { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ps { color:var(--dim); font-variant-numeric:tabular-nums; }
+  .x { background:none; color:var(--dim); font-weight:400; padding:0 5px;
+       border-radius:3px; font-size:12px; }
+  .x:hover { color:var(--red); }
+  .psum { color:var(--dim); border-top:1px solid var(--line);
+          margin-top:6px; padding-top:6px; }
+  .pbad { color:var(--red); margin-top:5px; }
 </style>
 </head>
 <body>
 <header>
   <h1>stream monitor</h1>
-  <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.heic,.heif">
+  <!-- No capture="environment": it makes Android Chrome open the camera and
+       return a single shot, which defeats multiple. Without it the OS sheet
+       still offers the camera, and the photo library allows multi-select. -->
+  <input type="file" id="file" multiple
+         accept=".pdf,.png,.jpg,.jpeg,.heic,.heif">
   <button id="go">Parse</button>
   <span id="clock">idle</span>
 </header>
 
 <main>
-  <section id="log"><h2>events</h2><div id="rows"></div></section>
-  <section id="out"><h2>sections</h2><div id="cards">
+  <section id="log">
+    <h2>pages</h2><div id="pages" hidden></div>
+    <h2>events</h2><div id="rows"></div>
+  </section>
+  <section id="out"><h2>report</h2><div id="who" hidden></div><div id="cards">
     <div class="empty">Pick a report and hit Parse.</div>
   </div></section>
 </main>
@@ -76,6 +103,78 @@
 const $ = s => document.querySelector(s);
 const rows = $('#rows'), cards = $('#cards');
 let t0 = 0, timer = null;
+
+// Mirrors of app/ingestion.py so a bad pick is caught before a 30 MB upload.
+// The server stays the authority - these only save the round trip.
+const MAX_PAGES = 12, MAX_BYTES = 30 * 1024 * 1024;
+// 3588 patches at MAX_LONG_EDGE=2200, x1.2 per OpenAI's image token formula.
+const TOKENS_PER_PAGE = 4306;
+
+// FileList is read-only and each pick replaces it, so keep our own ordered
+// array. On a phone you shoot a few pages at a time, and this is also what
+// makes removing one bad page possible without re-picking everything.
+let picked = [];
+
+const mb = n => (n / 1048576).toFixed(2) + ' MB';
+const isPdf = f => /\.pdf$/i.test(f.name);
+
+function problem() {
+  if (!picked.length) return 'Pick a report.';
+  if (picked.some(isPdf) && picked.length > 1)
+    return 'Upload one PDF, or photos of the pages - not both.';
+  if (picked.length > MAX_PAGES)
+    return `Too many pages: ${picked.length}. The limit is ${MAX_PAGES}.`;
+  const total = picked.reduce((a, f) => a + f.size, 0);
+  if (total > MAX_BYTES) return `Upload is ${mb(total)}; the limit is 30 MB.`;
+  return null;
+}
+
+function renderPages() {
+  const el = $('#pages');
+  el.textContent = '';
+  el.hidden = !picked.length;
+
+  picked.forEach((f, i) => {
+    const row = document.createElement('div');
+    row.className = 'p';
+    const n = document.createElement('span');
+    n.className = 'pn'; n.textContent = i + 1;
+    const name = document.createElement('span');
+    name.className = 'pf'; name.textContent = f.name;
+    const size = document.createElement('span');
+    size.className = 'ps'; size.textContent = mb(f.size);
+    const x = document.createElement('button');
+    x.className = 'x'; x.textContent = '×'; x.title = 'remove this page';
+    x.onclick = () => { picked.splice(i, 1); renderPages(); };
+    row.append(n, name, size, x);
+    el.append(row);
+  });
+
+  if (picked.length) {
+    const images = picked.filter(f => !isPdf(f)).length;
+    const sum = document.createElement('div');
+    sum.className = 'psum';
+    sum.textContent =
+      `${picked.length} page(s) · ${mb(picked.reduce((a, f) => a + f.size, 0))}`
+      + (images ? ` · ~${Math.round(images * TOKENS_PER_PAGE / 1000)}k image tokens`
+                : '');
+    el.append(sum);
+  }
+
+  const bad = picked.length ? problem() : null;
+  if (bad) {
+    const w = document.createElement('div');
+    w.className = 'pbad'; w.textContent = bad;
+    el.append(w);
+  }
+  $('#go').disabled = !!bad;
+}
+
+$('#file').onchange = e => {
+  picked.push(...e.target.files);
+  e.target.value = '';   // so the same file can be picked again
+  renderPages();
+};
 
 function log(kind, detail) {
   const el = document.createElement('div');
@@ -122,12 +221,41 @@ function card(section, provisional) {
   return el;
 }
 
+function who(d, provisional) {
+  const el = $('#who');
+  el.textContent = '';
+  el.className = provisional ? 'prov' : '';
+  const p = d.patient || {};
+  const age = [p.age, p.gender].filter(v => v != null && v !== '').join(' · ');
+  const fields = [
+    ['patient', p.name],
+    ['age/sex', age || null],
+    ['lab', d.lab_name],
+    ['doctor', d.doctor_name],
+    ['title', d.report_title],
+  ].filter(([, v]) => v != null && v !== '');
+
+  el.hidden = fields.length === 0;
+  for (const [label, value] of fields) {
+    const s = document.createElement('span');
+    const b = document.createElement('b');
+    b.textContent = label;
+    s.append(b, String(value));
+    el.append(s);
+  }
+}
+
 function handle(e) {
   if (e.type === 'status') {
-    log('status', `${e.stage} ${e.bytes ? '· ' + e.bytes + ' bytes' : ''}`
+    log('status', `${e.stage} ${e.pages ? '· ' + e.pages + ' page(s)' : ''}`
+      + `${e.bytes ? ' · ' + e.bytes + ' bytes' : ''}`
       + `${e.deadline_seconds ? '· deadline ' + e.deadline_seconds + 's' : ''}`);
   } else if (e.type === 'heartbeat') {
     log('heartbeat', `alive · ${e.elapsed_seconds}s`);
+  } else if (e.type === 'header') {
+    const p = e.data.patient || {};
+    log('header', [p.name, e.data.lab_name].filter(Boolean).join(' · ') || '(none)');
+    who(e.data, true);
   } else if (e.type === 'section') {
     log('section', `[${e.index}] ${e.data.category_name} · `
       + `${(e.data.tests || []).length} tests`);
@@ -136,7 +264,8 @@ function handle(e) {
     const n = (e.data.sections || []).reduce((a, s) => a + (s.tests || []).length, 0);
     log('result', `validated · ${e.data.sections.length} sections · ${n} tests`
       + ` · ${e.elapsed_seconds}s`);
-    // replace the provisional cards with the validated report
+    // replace the provisional header and cards with the validated report
+    who(e.data, false);
     cards.textContent = '';
     for (const s of e.data.sections) cards.append(card(s, false));
   } else if (e.type === 'error') {
@@ -147,17 +276,18 @@ function handle(e) {
 }
 
 $('#go').onclick = async () => {
-  const f = $('#file').files[0];
-  if (!f) return alert('Pick a file first.');
+  const bad = problem();
+  if (bad) return alert(bad);
 
-  rows.textContent = ''; cards.textContent = '';
+  rows.textContent = ''; cards.textContent = ''; $('#who').hidden = true;
   $('#go').disabled = true;
   t0 = performance.now();
   timer = setInterval(() => {
     $('#clock').textContent = ((performance.now() - t0) / 1000).toFixed(1) + 's';
   }, 100);
 
-  const body = new FormData(); body.append('file', f);
+  const body = new FormData();
+  for (const f of picked) body.append('file', f);
   try {
     const res = await fetch('/parse', { method: 'POST', body });
     if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`);
@@ -181,7 +311,8 @@ $('#go').onclick = async () => {
   } finally {
     clearInterval(timer);
     $('#clock').textContent = ((performance.now() - t0) / 1000).toFixed(1) + 's · done';
-    $('#go').disabled = false;
+    // re-check rather than blanket-enable: the pick may still be invalid
+    $('#go').disabled = !!problem();
   }
 };
 </script>

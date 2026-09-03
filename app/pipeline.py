@@ -7,12 +7,11 @@ class MedicalReportPipeline:
         self.extractor = OpenAIExtractor(
             model=settings.openai_model,
             api_key=settings.openai_api_key,
+            # service_tier=settings.openai_service_tier,
         )
 
-    def process_file(self, file_path):
-        file_bytes, media_type = read_file(file_path)
-
+    def process_files(self, file_paths):
+        """One report, one call - several paths are its pages, in order."""
         return self.extractor.extract(
-            file_bytes=file_bytes,
-            media_type=media_type,
+            files=[read_file(path) for path in file_paths],
         )

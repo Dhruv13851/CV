@@ -101,3 +101,13 @@ NEVER
 - Never diagnose, interpret or recommend.
 - Never omit a test because its value is missing, qualitative or abnormal.
 - Use null wherever the schema allows it rather than inventing a value.
+
+PAGES
+- When several images are provided they are pages of ONE report, in the order
+  given. Read every one, and return a single report covering them all.
+- The patient, lab and doctor header is reprinted on every page and describes
+  one patient. Never create a section per image.
+- Every page must belong to the same patient. If the pages show more than one
+  patient name, return an empty sections list.
+- If two images show the same page, extract that page once.
+- An image that is not part of the report contributes no tests. Ignore it.
