@@ -5,7 +5,7 @@ from langchain_openai import ChatOpenAI
 from langsmith import get_current_run_tree, traceable
 
 from app.config import PROMPTS_DIR
-from app.downscaling import downscale_all
+from vision_downscale import downscale_all
 from app.schemas import MedicalReport
 from app.streaming import stream_sections
 
@@ -26,8 +26,12 @@ def _files_summary(inputs: dict) -> dict:
     }
 
 
-def _report_summary(report) -> dict:
-    """Shape of the extraction, not its contents. Patient data stays out."""
+def report_summary(report) -> dict:
+    """Shape of the extraction, not its contents. Patient data stays out.
+
+    Public because main.py logs the same summary on its own span - the
+    grouping detectors below stay in one place instead of two.
+    """
     if not isinstance(report, MedicalReport):
         return {"result": "unavailable"}
 
@@ -40,7 +44,8 @@ def _report_summary(report) -> dict:
     # both "Complete Blood Count" and their own sub-header (1 run in 3), and CRP
     # came back as a second "Biochemistry" section (3 of 3). Neither is visible
     # in a section or test count, so count them directly. Empty sections were a
-    # third defect; MedicalReport.drop_empty_sections removes those outright.
+    # third defect; MedicalReport.normalise_sections merges the duplicate
+    # category and drops the empty one, so only the first is still countable.
     names = [t.name for t in tests]
     categories = [s.category_name for s in report.sections]
 
@@ -72,11 +77,16 @@ class OpenAIExtractor:
         model: str,
         api_key: str,
         service_tier: str = "default",
+        reasoning_effort: str | None = None,
     ):
         self.llm = ChatOpenAI(
             model=model,
             api_key=api_key,
             temperature=0,
+            # None leaves the model's own default. Reasoning is ~48% of the
+            # wall clock on a 9-page report, so this is the biggest latency
+            # knob here - see the table in README before turning it down.
+            reasoning_effort=reasoning_effort or None,
             # Empty string means "send no service_tier", so the project
             # default applies instead of a value the model may reject.
             service_tier=service_tier or None,
@@ -94,6 +104,7 @@ class OpenAIExtractor:
         )
 
         self.service_tier = service_tier
+        self.reasoning_effort = reasoning_effort
 
         self.structured_llm = self.llm.with_structured_output(
             MedicalReport
@@ -176,13 +187,14 @@ class OpenAIExtractor:
                 # "priority" for both "fast" and "priority", so the echo is
                 # not proof the request was served at this tier.
                 "requested_service_tier": self.service_tier or "project default",
+                "reasoning_effort": self.reasoning_effort or "model default",
             })
 
     @traceable(
         run_type="chain",
         name="extract",
         process_inputs=_files_summary,
-        process_outputs=_report_summary,
+        process_outputs=report_summary,
     )
     def extract(
         self,
@@ -204,7 +216,7 @@ class OpenAIExtractor:
         run_type="chain",
         name="extract_async",
         process_inputs=_files_summary,
-        process_outputs=_report_summary,
+        process_outputs=report_summary,
     )
     async def extract_async(
         self,

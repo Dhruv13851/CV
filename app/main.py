@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -7,11 +8,21 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from langsmith import trace
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    AuthenticationError,
+    PermissionDeniedError,
+    RateLimitError,
+)
+from pydantic import ValidationError
 
 load_dotenv()
 
 from .config import Settings
-from .extractors.openai import _report_summary
+from .extractors.openai import report_summary
+from .schemas import reject_mixed_patients, reject_unusable
 from .ingestion import MAX_UPLOAD_BYTES, media_types_for
 from .pipeline import MedicalReportPipeline
 
@@ -48,7 +59,20 @@ _generated_openapi = app.openapi
 app.openapi = lambda: _swagger_file_pickers(_generated_openapi())
 
 
-settings = Settings()
+logger = logging.getLogger(__name__)
+
+try:
+    settings = Settings()
+except ValidationError as exc:
+    # Field names only. The values are the secrets.
+    raise SystemExit(
+        "Configuration error: "
+        + ", ".join(
+            ".".join(str(part) for part in error["loc"]) for error in exc.errors()
+        )
+        + ". Copy .env.example to .env and fill it in."
+    )
+
 pipeline = MedicalReportPipeline(settings)
 
 # Hard ceiling for one upload. Must exceed the client's own worst case
@@ -66,6 +90,56 @@ def event(**payload) -> str:
     return "data: " + json.dumps(payload) + "\n\n"
 
 
+def _classify(exc: BaseException) -> tuple[str, str]:
+    """(stage, message) for the error frame. The only text a client ever sees.
+
+    Nothing here echoes an exception we did not write. An upstream message
+    quotes our own request back at us - a masked key and org id on an auth
+    failure, and on this path the document itself - so unknown exceptions are
+    logged in full and reported as one flat sentence.
+
+    Order matters twice: asyncio.TimeoutError IS the builtin TimeoutError,
+    which is an OSError, and ValidationError IS a ValueError.
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout", (
+            f"Extraction exceeded {EXTRACTION_DEADLINE}s and was cancelled."
+        )
+
+    if isinstance(exc, ValidationError):
+        # Unreachable today: stream_sections sanitises its own. Kept so that a
+        # model_validate added anywhere later cannot leak by default.
+        logger.error("unsanitised ValidationError, %d errors", exc.error_count())
+        return "invalid_response", (
+            "The model returned a malformed report. Please retry."
+        )
+
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+        logger.error("OpenAI rejected our credentials: %s", exc)
+        return "config", "The extraction service is not configured correctly."
+
+    if isinstance(exc, RateLimitError):
+        return "rate_limited", (
+            "The extraction service is busy. Please retry in a moment."
+        )
+
+    if isinstance(exc, (APITimeoutError, APIConnectionError)):
+        logger.warning("OpenAI unreachable: %s", exc)
+        return "upstream", "Could not reach the extraction service. Please retry."
+
+    if isinstance(exc, APIError):
+        logger.error("OpenAI error: %s", exc)
+        return "upstream", "The extraction service could not process the document."
+
+    if isinstance(exc, ValueError):
+        # Ours, and written to be read: ingestion, downscaling and
+        # stream_sections all raise plain ValueError with a safe message.
+        return "invalid_document", str(exc)
+
+    logger.error("unhandled error while parsing a report", exc_info=exc)
+    return "error", "Failed to process document."
+
+
 @app.get("/health")
 def health():
     return {
@@ -76,9 +150,12 @@ def health():
 @app.get("/", response_class=HTMLResponse)
 def monitor():
     """Dev page for watching the stream. Read per request so edits are live."""
-    return (Path(__file__).resolve().parent / "static" / "index.html").read_text(
-        encoding="utf-8"
-    )
+    page = Path(__file__).resolve().parent / "static" / "index.html"
+
+    try:
+        return page.read_text(encoding="utf-8")
+    except OSError:
+        raise HTTPException(status_code=404, detail="Dev monitor page is not installed.")
 
 
 async def _read_capped(upload: UploadFile, budget: int) -> bytes:
@@ -181,11 +258,16 @@ async def parse_report(
                 metadata={"model": settings.openai_model},
             ) as run:
 
-                stream = pipeline.extractor.extract_sections_async(
-                    files=files,
-                )
+                stream = pipeline.stream_pages(files)
 
                 while True:
+                    # Checked here as well as in the heartbeat loop below: a
+                    # stream that delivers an event just inside every
+                    # heartbeat window never goes idle, so the inner check is
+                    # never reached and the ceiling would not bind at all.
+                    if time.monotonic() - started > EXTRACTION_DEADLINE:
+                        raise asyncio.TimeoutError
+
                     pending = asyncio.ensure_future(stream.__anext__())
 
                     # Categories arrive minutes apart on a slow report, so
@@ -216,6 +298,12 @@ async def parse_report(
                         break
 
                     if kind == "header":
+                        # page_patients is complete here (it is written before
+                        # `sections`), so a mixed upload is refused now rather
+                        # than after streaming one patient's results under
+                        # another's name. Measured: 4.3s instead of 13.0s.
+                        reject_mixed_patients(payload.get("page_patients"))
+
                         # Provisional, like section below: patient identity
                         # lands ~12s before the validated result.
                         yield event(type="header", data=payload)
@@ -233,6 +321,9 @@ async def parse_report(
                         continue
 
                     result = payload
+
+                    reject_unusable(result)
+
                     yield event(
                         type="result",
                         data=result.model_dump(),
@@ -245,30 +336,17 @@ async def parse_report(
                 # detectors live in one place instead of two.
                 run.end(outputs={
                     "sections_streamed": sections_sent,
-                    **(_report_summary(result) if result else {}),
+                    **(report_summary(result) if result else {}),
                 })
 
             yield event(type="complete")
 
-        except asyncio.TimeoutError:
-            # Bare TimeoutError stringifies to "", so say something useful.
-            yield event(
-                type="error",
-                stage="timeout",
-                message=(
-                    f"Extraction exceeded {EXTRACTION_DEADLINE}s "
-                    "and was cancelled."
-                ),
-            )
-
-        except ValueError as exc:
-            yield event(type="error", message=str(exc))
-
+        # asyncio.CancelledError is a BaseException, so a client hanging up
+        # passes straight through to the finally below instead of being
+        # reported as a failure to a socket that is already gone.
         except Exception as exc:
-            yield event(
-                type="error",
-                message=f"Failed to process document: {exc}",
-            )
+            stage, message = _classify(exc)
+            yield event(type="error", stage=stage, message=message)
 
         finally:
             # Client hung up mid-stream: stop paying OpenAI for a result

@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 SUPPORTED_TYPES = {
     ".pdf": "application/pdf",
     ".jpg": "image/jpeg",
@@ -9,7 +8,6 @@ SUPPORTED_TYPES = {
     ".heic": "image/heic",
     ".heif": "image/heif",
 }
-
 
 def get_media_type(filename: str) -> str:
     extension = Path(filename).suffix.lower()
@@ -22,14 +20,12 @@ def get_media_type(filename: str) -> str:
 
     return SUPPORTED_TYPES[extension]
 
-
 # One upload is one report. 12 photographed pages is roughly 52k image tokens
 # at MAX_LONG_EDGE=2200 (3588 patches x 1.2 each). OpenAI's own ceilings are
 # 30000 patches PER IMAGE, 1500 images and 512 MB per request - all far above
 # this, so these two are spend caps, not API limits.
 MAX_PAGES = 12
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024
-
 
 def media_types_for(filenames: list[str]) -> list[str]:
     """Validate a whole upload: one PDF, or up to MAX_PAGES images.
@@ -54,7 +50,6 @@ def media_types_for(filenames: list[str]) -> list[str]:
         )
 
     return media_types
-
 
 def read_file(path: str) -> tuple[bytes, str]:
     file_path = Path(path)

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vision-downscale"
+version = "0.1.0"
+description = "Fit images under a vision model's input limit before sending them."
+requires-python = ">=3.10"
+
+# Floors, not the exact pins in requirements.txt. A library that pins exactly
+# forces its version onto every consumer and deadlocks resolution the first
+# time two services disagree. Ceilings are at the next major, which is where
+# Pillow has historically broken things.
+dependencies = [
+    "Pillow>=12.3.0,<13",
+    "pillow-heif>=1.6.0,<2",
+    "langsmith>=0.11.1,<1",
+]
+
+# Only the shared library ships. The parser service itself still runs from
+# source (`uvicorn app.main:app`) - packaging `app` would put a package named
+# "app" into every consumer's site-packages, which is the collision this
+# whole move exists to avoid.
+[tool.setuptools]
+packages = ["vision_downscale"]

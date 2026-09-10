@@ -9,11 +9,15 @@ class Settings(BaseSettings):
     openai_api_key: str
     openai_model: str
 
-    # Standard tier. "fast" is up to 2.5x faster but billed at a premium
-    # (2x standard for gpt-5.6-sol) - it was measurably not worth the cost
-    # here. Set OPENAI_SERVICE_TIER= (empty) to send no tier at all and let
-    # the project default apply instead.
-   
+    # The two measured latency levers, both defaulting to today's behaviour.
+    # Baseline on samples/sample2.pdf (9 pages): 12.8s to first event, 26.0s
+    # total. service_tier="fast" -> 7.4s / 13.0s at 2x the price.
+    # reasoning_effort="low" -> 7.6s / 21.5s for free, but it changes what the
+    # model computes, so re-run test_live.py before trusting it. "none" is
+    # faster still (3.6s / 15.5s) and demonstrably mis-groups; "minimal" is
+    # rejected by gpt-5.6-luna. Empty sends nothing and lets the default apply.
+    openai_service_tier: str = "default"
+    openai_reasoning_effort: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

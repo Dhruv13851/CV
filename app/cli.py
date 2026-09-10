@@ -2,6 +2,7 @@ import argparse
 import json
 
 from .config import Settings
+from .schemas import reject_unusable
 from .pipeline import MedicalReportPipeline
 
 
@@ -24,7 +25,13 @@ def main():
     settings = Settings()
     pipeline = MedicalReportPipeline(settings)
 
-    result = pipeline.process_files(args.file)
+    # FileNotFoundError is an OSError; ingestion and downscaling raise
+    # ValueError. Either way the user wants one line, not a traceback.
+    try:
+        result = pipeline.process_files(args.file)
+        reject_unusable(result)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"error: {exc}")
 
     print(
         json.dumps(

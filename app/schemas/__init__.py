@@ -4,6 +4,8 @@ from app.schemas.medical_report import (
     ReferenceRange,
     TestResult,
     TestSection,
+    reject_mixed_patients,
+    reject_unusable,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "ReferenceRange",
     "TestResult",
     "TestSection",
+    "reject_mixed_patients",
+    "reject_unusable",
 ]

@@ -50,6 +50,15 @@ result    data, elapsed_seconds  <- validated MedicalReport
 complete
 ```
 
+The HTTP status is 200 once the stream opens, so failures arrive as a terminal
+`error` frame with no `result` or `complete` after it. Two of those are worth
+knowing about: an upload whose pages show more than one patient name, or that
+is not a medical report at all, ends here rather than as a `result` carrying an
+empty `sections` list - which a consumer would read as "this person had no
+tests". A stream cut off mid-write (the model hitting its output cap) ends here
+too, with a fixed message: pydantic quotes the failing input back in its own
+message, and that input is patient data.
+
 ### Why category-at-a-time, not token-by-token
 
 Token-level parsing of lab values is unsafe. A partial parse of `118` renders
@@ -121,14 +130,14 @@ app/
     extraction.md    the system prompt - edit without touching code
   schemas/
     medical_report.py  Pydantic output schema
-  downscaling/
-    image.py         shrink images under OpenAI's patch limit
   streaming/
     sections.py      emit whole categories as the model closes them
   static/
     index.html       stream monitor UI served at /
   extractors/
     openai.py        the extractor - OpenAI is the only provider
+vision_downscale/    shared library, installable on its own (see below)
+  downscaler.py      ImageDownscaler - shrink images under a patch limit
 samples/             test documents (gitignored - may contain patient data)
 ```
 
@@ -166,11 +175,48 @@ OpenAI rejects images above 30000 patches, where
 `patches = ceil(width/32) * ceil(height/32)`. A 600 DPI Letter scan
 (5100x6600) is 33120 and returns HTTP 400.
 
-`app/downscaling/` handles this automatically: images over the cap are
+`vision_downscale/` handles this automatically: images over the cap are
 flattened to RGB, resized with LANCZOS to a 2200px long edge (~200 DPI,
 3726 patches) and re-encoded as 4:4:4 JPEG. Images already under the cap are
-passed through untouched, unless the format is one OpenAI cannot read. Tune
-`MAX_LONG_EDGE` in `app/downscaling/image.py`.
+passed through untouched, unless the format is one OpenAI cannot read or the
+file carries an EXIF rotation - the passthrough returns the original bytes, so
+a rotated one has to be re-encoded to bake the rotation into the pixels. Tune
+`MAX_LONG_EDGE` in `vision_downscale/downscaler.py`, or pass `max_long_edge=`
+per instance.
+
+## Sharing downscaling with other services
+
+`vision_downscale/` is a standalone package - stdlib, Pillow, pillow-heif and
+langsmith, and nothing from `app/`. Another Python service installs it and gets
+byte-identical sizing:
+
+```bash
+pip install git+ssh://git@<host>/<repo>@v0.1.0     # or a path, in a monorepo
+```
+
+```python
+from vision_downscale import ImageDownscaler
+
+downscaler = ImageDownscaler()                              # OpenAI's limits
+# downscaler = ImageDownscaler(max_long_edge=1600, profile="thumbnails")
+
+for file_bytes, media_type in downscaler.downscale_all(files):
+    ...   # PDFs are forwarded byte-for-byte
+```
+
+Instances are cheap and hold only config, so make one per provider profile.
+They **share a single 8-worker thread pool** by default - a pool per instance
+would multiply threads by the profile count. Pass `executor=` to isolate one
+deliberately. `profile=` is what tells two instances apart in LangSmith.
+
+There is deliberately no `POST /downscale` endpoint. It would put the bytes on
+the wire twice (upload raw, download reduced) before they go to OpenAI anyway,
+for exactly the same Pillow CPU cost, and expose an unauthenticated image
+decoder. Only worth revisiting for a caller that cannot run Python.
+
+`pyproject.toml` ships `vision_downscale` alone. The parser service still runs
+from source; packaging `app` would drop a package named `app` into every
+consumer's `site-packages`.
 
 ## Timeouts
 
@@ -181,7 +227,11 @@ passed through untouched, unless the format is one OpenAI cannot read. Tune
 | `EXTRACTION_DEADLINE` | `main.py` | 300s hard ceiling |
 
 They multiply - raise `REQUEST_TIMEOUT` and `MAX_RETRIES` only together, and
-keep `EXTRACTION_DEADLINE` above their product. LangChain discards the OpenAI
+keep `EXTRACTION_DEADLINE` above their product. The deadline is checked in two
+places in `main.py`: once per event, and once per heartbeat. Both are needed -
+the per-heartbeat check alone never fires on a stream that keeps delivering
+inside `HEARTBEAT_INTERVAL`, and the per-event check alone never fires on a
+stream that stalls for good. LangChain discards the OpenAI
 SDK's default timeout and leaves httpx on `Timeout(None)`, so setting these
 explicitly is what stops a hung call holding a task, a thread and a pool slot
 forever.

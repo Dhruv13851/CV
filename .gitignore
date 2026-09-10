@@ -9,6 +9,9 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+# setuptools leaves these in the tree when vision_downscale is pip-installed
+build/
+dist/
 
 # Patient data / uploads - medical documents must not enter git history.
 # Bracket classes, not plain *.pdf: gitignore is case-sensitive and cameras

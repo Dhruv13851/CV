@@ -25,14 +25,14 @@ import warnings
 from dotenv import load_dotenv
 
 load_dotenv()
-# The unresolved PHI decision: LangChain's own span around the model call
-# carries the base64 document and the patient name. Never send that from a
-# test run, whatever .env says.
-os.environ["LANGSMITH_TRACING"] = "false"
+# Tracing is left to .env deliberately - runs from here should show up in
+# LangSmith so they can be inspected directly, not just read about. Note that
+# LangChain's own span around the model call carries the base64 document and
+# the patient name; our spans stay redacted.
 warnings.filterwarnings("ignore")
 
 from app.config import Settings
-from app.extractors.openai import OpenAIExtractor, _report_summary
+from app.extractors.openai import OpenAIExtractor, report_summary
 from app.ingestion import read_file
 
 TRUTH = [
@@ -119,7 +119,7 @@ def check(report) -> list[str]:
         elif got_name != want:
             failures.append(f"name {got_name!r} should be the printed {want!r}")
 
-    summary = _report_summary(report)
+    summary = report_summary(report)
     if summary["tests"] != TRUE_TESTS:
         failures.append(
             f"{summary['tests']} tests, the page prints {TRUE_TESTS}"
@@ -159,7 +159,7 @@ async def main():
     for i, report in enumerate(reports):
         failures = check(report)
         passed += not failures
-        summary = _report_summary(report)
+        summary = report_summary(report)
         print(f"\nrun {i}: sections={summary['sections']} "
               f"tests={summary['tests']} "
               f"largest={summary['largest_category_tests']} "
